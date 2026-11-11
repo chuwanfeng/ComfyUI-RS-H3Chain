@@ -2,7 +2,7 @@
 
 MiniMax H3 的**分段续接**节点：一次执行只跑一段，段间上下文落盘，下一段读回来钉住。
 
-**不依赖任何第三方节点包**（不需要 T8，也不需要 JZL）：条件编码、跨段引导、双时钟 shift、
+**不依赖任何第三方节点包**：条件编码、跨段引导、双时钟 shift、
 采样、解码全部走 ComfyUI 核心（`comfy.sample` / `comfy.nested_tensor` / `node_helpers` /
 `comfy.model_sampling` / `comfy_extras.nodes_minimax_h3`）。
 
