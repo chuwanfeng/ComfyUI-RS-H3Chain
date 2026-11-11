@@ -27,6 +27,7 @@ import comfy.model_management
 import comfy.model_sampling
 import comfy.nested_tensor
 import comfy.sample
+import comfy.samplers
 import comfy.utils
 import node_helpers
 
@@ -358,11 +359,13 @@ def sample_av(model, positive, latent: dict, *, seed: int, steps: int, cfg: floa
     noise = comfy.sample.prepare_noise(latent_image, int(seed), None)
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
     if sigmas is not None:
+        # sample_custom 的 sampler 参数是**采样器对象**（KSamplerSelect 的输出），
+        # 不是名字字符串——传 "lcm" 会在 sampler.sample 处炸 str has no attribute sample
         return comfy.sample.sample_custom(
             model,
             noise,
             float(cfg),
-            str(sampler_name),
+            comfy.samplers.sampler_object(str(sampler_name)),
             sigmas,
             positive,
             [],
