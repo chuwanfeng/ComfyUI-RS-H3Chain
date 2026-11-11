@@ -390,7 +390,13 @@ def sample_av(model, positive, latent: dict, *, seed: int, steps: int, cfg: floa
 
 
 def decode_av(vae, audio_vae, samples):
-    """联合 AV latent → (IMAGE [T,H,W,C], AUDIO dict|None)。"""
+    """联合 AV latent → (IMAGE [T,H,W,C], AUDIO dict|None)。
+
+    audio 走**官方 VAEDecodeAudio 同一条路径**：
+    `vae.decode()` 包装层（不是 first_stage_model.decode）+ 响度归一化 +
+    `audio_sample_rate_output` 优先。少了这层，采样率/波形会与官方工作流不一致，
+    SaveVideo 那边就会拿一个错误的 sample_rate 去开 AAC。
+    """
     video_z, audio_z = _nested_parts(samples)
     print(f"[RS-H3Chain] video VAE 解码开始：latent {tuple(video_z.shape)}", flush=True)
     image = vae.decode(video_z)
@@ -401,10 +407,18 @@ def decode_av(vae, audio_vae, samples):
     audio = None
     if audio_z is not None and audio_vae is not None:
         print(f"[RS-H3Chain] audio VAE 解码开始：latent {tuple(audio_z.shape)}", flush=True)
-        waveform = audio_vae.first_stage_model.decode(audio_z)
-        audio = {
-            "waveform": waveform,
-            "sample_rate": int(getattr(audio_vae, "audio_sample_rate", 32000)),
-        }
-        print(f"[RS-H3Chain] audio VAE 解码完成：{tuple(waveform.shape)}", flush=True)
+        waveform = audio_vae.decode(audio_z).movedim(-1, 1)
+        std = torch.std(waveform, dim=[1, 2], keepdim=True) * 5.0
+        std[std < 1.0] = 1.0
+        waveform = waveform / std
+        sample_rate = getattr(
+            audio_vae,
+            "audio_sample_rate_output",
+            getattr(audio_vae, "audio_sample_rate", 44100),
+        )
+        audio = {"waveform": waveform, "sample_rate": int(sample_rate)}
+        print(
+            f"[RS-H3Chain] audio VAE 解码完成：{tuple(waveform.shape)} @ {int(sample_rate)}Hz",
+            flush=True,
+        )
     return image, audio
