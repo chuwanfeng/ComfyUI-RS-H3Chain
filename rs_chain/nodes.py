@@ -377,6 +377,17 @@ class RS_H3ChainSegment:
         t_sample = time.time() - t1
         print(f"[RS-H3Chain] 段{plan['index']} 采样完成（{t_sample:.1f}s），开始 VAE 解码…", flush=True)
 
+        # 一次执行只跑一段：采样后扩散模型不会再被用到，显式卸载给 VAE 解码腾显存。
+        # 不卸的话 ComfyUI 会走 dynamic VRAM loading（把 VAE 分页装进来），
+        # 表现为日志停在 "Model MiniMaxH3VideoVAE prepared for dynamic VRAM loading" 很久。
+        try:
+            import comfy.model_management as model_management
+
+            model_management.unload_all_models()
+            print("[RS-H3Chain] 已卸载扩散模型，为 VAE 解码腾显存", flush=True)
+        except Exception as exc:  # noqa: BLE001 —— 卸载失败不该阻断出片
+            print(f"[RS-H3Chain] 卸载模型跳过（{type(exc).__name__}: {exc}）", flush=True)
+
         t2 = time.time()
         frames, generated_audio = h3.decode_av(video_vae, audio_vae, sampled)
         t_decode = time.time() - t2

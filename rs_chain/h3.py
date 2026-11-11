@@ -392,15 +392,19 @@ def sample_av(model, positive, latent: dict, *, seed: int, steps: int, cfg: floa
 def decode_av(vae, audio_vae, samples):
     """联合 AV latent → (IMAGE [T,H,W,C], AUDIO dict|None)。"""
     video_z, audio_z = _nested_parts(samples)
+    print(f"[RS-H3Chain] video VAE 解码开始：latent {tuple(video_z.shape)}", flush=True)
     image = vae.decode(video_z)
     if image.ndim == 5:
         image = image[0]
+    print(f"[RS-H3Chain] video VAE 解码完成：{tuple(image.shape)}", flush=True)
 
     audio = None
     if audio_z is not None and audio_vae is not None:
+        print(f"[RS-H3Chain] audio VAE 解码开始：latent {tuple(audio_z.shape)}", flush=True)
         waveform = audio_vae.first_stage_model.decode(audio_z)
         audio = {
             "waveform": waveform,
             "sample_rate": int(getattr(audio_vae, "audio_sample_rate", 32000)),
         }
+        print(f"[RS-H3Chain] audio VAE 解码完成：{tuple(waveform.shape)}", flush=True)
     return image, audio
