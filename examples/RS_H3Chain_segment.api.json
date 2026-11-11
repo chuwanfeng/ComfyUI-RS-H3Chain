@@ -1,0 +1,192 @@
+{
+  "1": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "miniMax/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "2": {
+    "class_type": "LoraLoaderModelOnly",
+    "inputs": {
+      "lora_name": "miniMax/minimax_h3_turbo_v4_step600_ema.safetensors",
+      "strength_model": 1.0,
+      "model": [
+        "1",
+        0
+      ]
+    }
+  },
+  "3": {
+    "class_type": "LoraLoaderModelOnly",
+    "inputs": {
+      "lora_name": "miniMax/MysticXXX_MMH3-V5-ref2va.safetensors",
+      "strength_model": 0.5,
+      "model": [
+        "2",
+        0
+      ]
+    }
+  },
+  "4": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "miniMax/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "type": "minimax",
+      "device": "default"
+    }
+  },
+  "5": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "miniMax/minimax_h3_video_vae_int8_convrot.safetensors"
+    }
+  },
+  "6": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "miniMax/minimax_h3_audio_vae_fp32.safetensors"
+    }
+  },
+  "7": {
+    "class_type": "ModelAttentionBackend",
+    "inputs": {
+      "attention": "comfy kitchen attention",
+      "model": [
+        "3",
+        0
+      ]
+    }
+  },
+  "8": {
+    "class_type": "ResolutionSelector",
+    "inputs": {
+      "aspect_ratio": "9:16 (Portrait Widescreen)",
+      "megapixels": 0.4,
+      "multiple": 32
+    }
+  },
+  "10": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": ""
+    }
+  },
+  "11": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": ""
+    }
+  },
+  "12": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": ""
+    }
+  },
+  "13": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": ""
+    }
+  },
+  "14": {
+    "class_type": "LoadAudio",
+    "inputs": {
+      "audio": ""
+    }
+  },
+  "20": {
+    "class_type": "RS_H3ChainSegment",
+    "inputs": {
+      "model": [
+        "7",
+        0
+      ],
+      "clip": [
+        "4",
+        0
+      ],
+      "video_vae": [
+        "5",
+        0
+      ],
+      "audio_vae": [
+        "6",
+        0
+      ],
+      "chain_dir": "mv-test",
+      "segment_index": 1,
+      "prompt": "subject_definitions:/n<Subject 1> is the woman in <Picture 1>; the setting is <Picture 2>.\nsummary:/n她扶着吊环站定，回头看向镜头。/nretention_analysis:/n<Picture 1>: preserve only face, hair base and body type; wardrobe and pose follow this text.\ndetailed_description:/n[Shot 1: 00:00.000 - 00:05.000 | 站定回头] She stands with her right hand on the overhead rail, weight on the left foot, then turns her head over the right shoulder toward the camera and holds the gaze.\noverall_soundscape:/nSubway rumble.\nnon_diegetic_music:/nFollow <Audio 1>.",
+      "seed": 1,
+      "width": [
+        "8",
+        0
+      ],
+      "height": [
+        "8",
+        1
+      ],
+      "render_window_frames": 124,
+      "context_frames": 22,
+      "steps": 4,
+      "cfg": 1.0,
+      "shift_video": 12.0,
+      "shift_audio": 3.0,
+      "sampler_name": "res_multistep",
+      "scheduler": "simple",
+      "ref_scale": 1.0,
+      "force_rerun": false,
+      "allow_no_prev": false,
+      "drive_audio": [
+        "14",
+        0
+      ],
+      "ref_image_0": [
+        "10",
+        0
+      ],
+      "ref_image_1": [
+        "11",
+        0
+      ],
+      "ref_image_2": [
+        "12",
+        0
+      ],
+      "keyframe_image_1": [
+        "13",
+        0
+      ],
+      "keyframe_time_1": 0.0,
+      "keyframe_time_2": -1.0,
+      "keyframe_time_3": -1.0
+    }
+  },
+  "25": {
+    "class_type": "CreateVideo",
+    "inputs": {
+      "images": [
+        "20",
+        0
+      ],
+      "audio": [
+        "20",
+        1
+      ],
+      "fps": 24.0
+    }
+  },
+  "30": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "video": [
+        "25",
+        0
+      ],
+      "filename_prefix": "RS_H3Chain/seg",
+      "format": "auto",
+      "codec": "auto"
+    }
+  }
+}
