@@ -405,6 +405,13 @@ class RS_H3ChainSegment:
         if delivery_audio is None:
             raise ChainError("本段没有可交付的音频（既没有 drive_audio，模型也没生成音频）")
         out_audio = media.trim_audio(delivery_audio, drop)
+        # AAC 编码器在部分 PyAV/FFmpeg 构建上对 32k 会 EINVAL：交付前统一到 48k
+        out_audio = media.ensure_audio_rate(out_audio, 48000)
+        print(
+            f"[RS-H3Chain] 交付音轨：{out_audio['sample_rate']}Hz"
+            f" × {int(out_audio['waveform'].shape[-1])} 样本",
+            flush=True,
+        )
 
         # ---- 落盘：先写 context 再写 meta（meta 是"这段可用"的标记，必须最后写）
         video_tail, audio_tail = h3.latent_tails(sampled, plan["context_frames"])

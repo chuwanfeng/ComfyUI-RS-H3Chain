@@ -80,6 +80,25 @@ def trim_audio(audio, drop_frames: int, fps: int = FPS):
     return {"waveform": wave[..., drop:], "sample_rate": rate}
 
 
+def ensure_audio_rate(audio, target_rate: int = 48000):
+    """把交付音轨统一到 AAC 友好的采样率。
+
+    为什么需要：H3 模型音轨是 32kHz；部分 PyAV/FFmpeg 构建在
+    `add_stream("aac", rate=32000)` 时 `avcodec_open2` 直接返回 EINVAL。
+    44.1/48k 原样保留，其余线性重采样到 48k（不改音高/时长）。
+    """
+    if audio is None:
+        return None
+    wave, rate = waveform_of(audio)
+    if int(rate) == int(target_rate) or int(rate) in (44100, 48000):
+        return audio
+    n = max(1, round(wave.shape[-1] * float(target_rate) / float(rate)))
+    out = torch.nn.functional.interpolate(
+        wave.float(), size=n, mode="linear", align_corners=False
+    )
+    return {"waveform": out, "sample_rate": int(target_rate)}
+
+
 # ---------------------------------------------------------------- 视频
 
 
