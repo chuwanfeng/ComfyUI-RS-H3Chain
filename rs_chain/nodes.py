@@ -357,6 +357,12 @@ class RS_H3ChainSegment:
         t_cond = time.time() - t0
 
         t1 = time.time()
+        print(
+            f"[RS-H3Chain] 段{plan['index']} 开始采样：{width}x{height} · {plan['render_frames']} 帧"
+            f" · {steps} 步 · cfg={cfg} · sampler={sampler_name}"
+            + ("（自定义 Sigmas）" if sigmas is not None else f" · scheduler={scheduler}"),
+            flush=True,
+        )
         sampled = h3.sample_av(
             shifted,
             positive,
@@ -369,10 +375,17 @@ class RS_H3ChainSegment:
             sigmas=sigmas,
         )
         t_sample = time.time() - t1
+        print(f"[RS-H3Chain] 段{plan['index']} 采样完成（{t_sample:.1f}s），开始 VAE 解码…", flush=True)
 
         t2 = time.time()
         frames, generated_audio = h3.decode_av(video_vae, audio_vae, sampled)
         t_decode = time.time() - t2
+        print(
+            f"[RS-H3Chain] 段{plan['index']} 解码完成：{int(frames.shape[0])} 帧"
+            f"（{t_decode:.1f}s）"
+            + ("，含模型音轨" if generated_audio is not None else "，无模型音轨"),
+            flush=True,
+        )
 
         # ---- 裁头：段首被钉住的窗口帧解码后会原样出现，必须裁掉（音频同量裁）
         drop = plan["head_trim"]
