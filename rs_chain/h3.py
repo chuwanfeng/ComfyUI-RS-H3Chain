@@ -1,13 +1,14 @@
-"""只用 ComfyUI 核心实现的 MiniMax H3 能力（不依赖 T8、不依赖 JZL）。
+"""只用 ComfyUI 核心实现的 MiniMax H3 能力（不依赖任何第三方节点包）。
 
-两个参考实现各有一半更好，这里各取所长：
+四个参考实现（身份与版本见 README），这里只取与本模块相关的结论：
 
-| 维度 | T8 InNodeLoop | JZL 无限时长 | 本模块取 |
-|---|---|---|---|
-| 段间引导 | 自己 patch `extra_conds`，每 token 一个 keyframe | 官方 `minimax_keyframes`，一个多帧 keyframe | **JZL**（原生，不 patch，升级不易碎） |
-| 视频/音频 shift | 自研双时钟采样 | 不设（用模型默认） | **T8 的语义 + 官方 `MiniMaxH3SigmaShift` 的实现** |
-| 采样 | 自研循环 | `comfy.sample.sample` | 官方路径 |
-| 裁剪 | 像素域 | 像素域 + settle | 像素域（settle 待做，见 README） |
+  · 段间引导：官方 `minimax_keyframes`。JZL 用一个多帧块，ooizj 用逐 token 的精确位置；
+    两种写法在官方 layout 里等价，本模块用多帧块。
+  · 双时钟 shift：T8 的语义 + 官方 `MiniMaxH3SigmaShift` 的同一实现。
+  · 音频相位：ooizj 的「结束对齐 + 分数/负索引」，由 `state.audio_guide_index`
+    计算、`layout_contract` 在首跑前验证宿主语义。
+  · 裁剪：像素域裁衔接窗口；JZL 的 settle 需要额外的段级时间轴记账，暂不做。
+  · 不采用：ZenHG 的 `noise_mask` 拷贝桥（绑定宿主 ≥0.35 且多一份 latent 拷贝）。
 
 关键源码事实（官方 `nodes_minimax_h3.py`，不是推测）：
   · 视频 latent 的 T 轴不均匀：token k 覆盖 FRAME_PER_TOKEN[k%5]=(1,4,4,4,4) 帧，5 token = 17 帧；
@@ -32,16 +33,17 @@ import comfy.utils
 import node_helpers
 
 from .state import (
+    AUDIO_LATENT_FPS,
     CONTEXT_FRAME_STEPS,
     FPS,
+    FRAME_RESCALE,
     align_frame_count,
     pixel_frames_from_latent_t,
+    signed_audio_overhang,
     temporal_shape,
     video_latent_t,
 )
 
-AUDIO_LATENT_FPS = 40
-FRAME_RESCALE = 5.0 / 3.0
 CANVAS_MULTIPLE = 32
 BASE_SHORT_EDGE = 768
 MAX_PIXELS = 768 * 1344
@@ -99,13 +101,16 @@ def latent_tails(samples, context_frames: int) -> tuple[torch.Tensor, torch.Tens
 
 
 def audio_overhang(samples) -> float:
-    """音频 latent 与视频时间轴的相位差（0 ≤ x < 1）。写错会让下一段音画漂 1/40 秒。"""
+    """音频 latent 相对视频时间轴的相位差（单位：音频步，带符号）。
+
+    负值同样有意义：render 窗口 ≡ 2 (mod 3) 时源音频比视频**短** 1/3 步，
+    下一段必须把音频锚点往前放，否则每段晚 0.4 帧（约 16.7ms）。
+    """
     video, audio = _nested_parts(samples)
     if audio is None:
         return 0.0
     frames = pixel_frames_from_latent_t(int(video.shape[2]))
-    value = int(audio.shape[-1]) - FRAME_RESCALE * frames
-    return value if 0.0 <= value < 1.0 else 0.0
+    return signed_audio_overhang(int(audio.shape[-1]), frames)
 
 
 # ---------------------------------------------------------------- 条件
@@ -297,23 +302,41 @@ def media_waveform(audio):
     return wave, int(audio["sample_rate"])
 
 
+def _index_value(value: float):
+    """整数索引写成 int（与官方 AddGuide 的存档形状一致），分数索引保留 float。"""
+    number = float(value)
+    return int(number) if number.is_integer() else number
+
+
 def add_guide_keyframe(positive, video_tail: torch.Tensor | None, audio_tail: torch.Tensor | None,
-                       frame_index: int = 0):
+                       frame_index: int = 0, audio_frame_index: float | None = None):
     """把锚点钉成本段时间轴起点（官方 MiniMaxH3AddGuide 的同一结构）。
 
     一个 keyframe 可以同时带 `latent`（视频片段）与 `audio_latent`（整段音频）——
     这正是官方"带音轨的引导片段"的形状：视频只钉前 N 帧，音频可以覆盖整段。
     不 patch 模型：官方 `minimax_keyframes` 本来就被 DiT 读取（cond 行永不降噪、每步重注入）。
+
+    音频索引与视频不同时（续接段的音频尾需要**结束**对齐钉住窗），拆成两个 keyframe：
+    视频留在 `frame_index`，音频用 `audio_frame_index`（可为负、可为分数）。
     """
     if video_tail is None and audio_tail is None:
         return positive
+    video_pos = float(frame_index)
+    audio_pos = video_pos if audio_frame_index is None else float(audio_frame_index)
     keyframes = list((positive[0][1] or {}).get("minimax_keyframes") or [])
-    keyframe = {"resolved_frame_index": int(frame_index)}
-    if video_tail is not None:
-        keyframe["latent"] = video_tail
-    if audio_tail is not None:
-        keyframe["audio_latent"] = audio_tail
-    keyframes.append(keyframe)
+
+    if video_tail is not None and audio_tail is not None and abs(audio_pos - video_pos) > 1e-9:
+        keyframes.append({"resolved_frame_index": _index_value(video_pos), "latent": video_tail})
+        keyframes.append({"resolved_frame_index": _index_value(audio_pos), "audio_latent": audio_tail})
+    else:
+        anchor = video_pos if video_tail is not None else audio_pos
+        keyframe = {"resolved_frame_index": _index_value(anchor)}
+        if video_tail is not None:
+            keyframe["latent"] = video_tail
+        if audio_tail is not None:
+            keyframe["audio_latent"] = audio_tail
+        keyframes.append(keyframe)
+
     return node_helpers.conditioning_set_values(positive, {"minimax_keyframes": keyframes})
 
 

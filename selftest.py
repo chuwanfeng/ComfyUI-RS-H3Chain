@@ -249,6 +249,20 @@ def comfy_checks() -> tuple[list[str], list[str]]:
             problems.append(f"rs_chain.h3 导入失败：{exc}")
             print(f"  {BAD} {exc}")
 
+    print("\n== 宿主 H3 布局语义 ==")
+    try:
+        from rs_chain import layout_contract
+
+        layout_contract.ensure()
+        print(f"  {OK} 分数/负 keyframe 索引与音频窗位置符合预期")
+    except Exception as exc:  # noqa: BLE001
+        if _is_cuda_error(exc):
+            skipped.append("rs_chain.layout_contract（当前解释器没有 GPU）")
+            print(f"  {SKIP} 跳过 —— 当前解释器看不到 GPU")
+        else:
+            problems.append(f"布局校验失败：{exc}")
+            print(f"  {BAD} {exc}")
+
     return problems, skipped
 
 

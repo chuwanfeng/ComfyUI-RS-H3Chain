@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from rs_chain.state import (  # noqa: E402
     FPS,
+    CONTEXT_FRAME_CHOICES,
     ChainError,
     audio_window_start_seconds,
     chain_timeline_start,
@@ -97,6 +98,19 @@ check(
 
 p3 = plan_segment(158, 39, 3)
 check("158 帧 + 39 上下文 → 每段推进 119 帧", p3["advance_frames"] == 119 and p3["timeline_start_frames"] == 238)
+
+# 更大的衔接窗（56/73/90 = 17/22/27 token），用于长镜头/多人场景
+check("衔接窗选择包含 56/73/90", {56, 73, 90}.issubset(set(CONTEXT_FRAME_CHOICES)), str(CONTEXT_FRAME_CHOICES))
+p56 = plan_segment(124, 56, 2)
+check("124 窗口 + 56 上下文 → 推进/交付 68 帧", p56["advance_frames"] == 68 and p56["output_frames"] == 68, str(p56))
+check("56 窗口的起点 = 124 − 56 = 68", p56["timeline_start_frames"] == 68)
+p73 = plan_segment(124, 73, 2)
+check("124 窗口 + 73 上下文 → 交付 51 帧", p73["output_frames"] == 51, str(p73["output_frames"]))
+p90 = plan_segment(192, 90, 2)
+check("192 窗口 + 90 上下文 → 交付 102 帧", p90["output_frames"] == 102)
+check("56 帧上下文 = 17 token", video_latent_t(56) == 17)
+check("73 帧上下文 = 22 token", video_latent_t(73) == 22)
+check("90 帧上下文 = 27 token", video_latent_t(90) == 27)
 
 expect_error("段长 120 不是 17k+5 → 拒绝", lambda: plan_segment(120, 22, 1), "17k+5")
 expect_error("段长 124 / 上下文 20 → 拒绝", lambda: plan_segment(124, 20, 1), "不是支持的窗口")

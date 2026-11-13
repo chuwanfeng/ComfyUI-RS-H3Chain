@@ -1,7 +1,7 @@
 """链状态：路径规划、段几何、meta 守卫。
 
 这个模块**只用标准库**，所以可以在没装 torch / 没装 ComfyUI 的机器上直接跑测试
-（`python tests/test_state.py`）。所有与张量相关的部分在 media.py，与 T8 耦合的部分在 t8.py。
+（`python tests/test_state.py`）。所有与张量相关的部分在 media.py。
 
 为什么把"段几何"写成纯函数：
     段长/窗口/裁切三者一旦算错，成片表现为"接缝处跳一下"或"越跑越短"，
@@ -22,12 +22,14 @@ SCHEMA = 1
 
 FPS = 24
 AUDIO_LATENT_FPS = 40
+# 像素帧 → 音频 latent 步的换算（40Hz / 24fps）
+FRAME_RESCALE = float(AUDIO_LATENT_FPS) / float(FPS)
 
 # H3 视频 latent 的 T 轴不均匀：token k 覆盖 FRAME_PER_TOKEN[k % 5] 帧，5 token = 17 帧。
 # 段长必须是 17k+5、上下文窗口必须是 17m+5，两者相减才是 17 的倍数 ⇒ 尾窗起点落在 token 边界。
 # 这就是"相位自动对齐"的全部来源（JZL AssetManagerInfinite 的注释里同样写明）。
 FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
-CONTEXT_FRAME_STEPS = {5: 2, 22: 7, 39: 12}
+CONTEXT_FRAME_STEPS = {5: 2, 22: 7, 39: 12, 56: 17, 73: 22, 90: 27}
 MAX_CONTEXT_FRAMES = max(CONTEXT_FRAME_STEPS)
 
 # 渲染窗口候选：全部是 17k+5
@@ -231,6 +233,39 @@ def keyframe_local_frame(time_seconds: float, plan: dict) -> int:
     return round(float(time_seconds) * FPS) - int(plan["timeline_start_frames"])
 
 
+def signed_audio_overhang(audio_steps: int, video_frames: int) -> float:
+    """源段音频 latent 相对视频时间轴的相位差，单位 = 音频步，带符号。
+
+    H3 的音频步数按**总帧数四舍五入**生成，所以差值只可能是 ±1/3 步：
+      · render 124（≡1 mod 3）→ +1/3
+      · render 141（≡0 mod 3）→ 0
+      · render 107/158（≡2 mod 3）→ −1/3
+    早先这里把负值归零，导致后两种窗口的音频锚点整体晚 0.2~0.4 帧；
+    负向外溢正是需要被补偿的那一半。
+    """
+    value = float(int(audio_steps)) - FRAME_RESCALE * float(int(video_frames))
+    return value if -0.5 < value <= 0.5 else 0.0
+
+
+def audio_guide_index(context_frames: int, audio_steps: int,
+                      overhang_steps: float = 0.0) -> float:
+    """续接段音频尾的 keyframe 索引：让音频窗**结束**在视频钉住窗的末端。
+
+    视频钉住窗占本段时间轴的 [0, context_frames)；
+    上一段的音频相对视频多/少 `overhang_steps` 步，所以它的末端落在
+    `context_frames + overhang / FRAME_RESCALE` 帧处。音频尾长 `audio_steps` 步，
+    起点 = 末端 − audio_steps / FRAME_RESCALE。
+
+    末端还要吸附到目标段的音频行（整数坐标 = FRAME_RESCALE × 帧号），
+    否则钉住的音频会落在两行之间，每段固定偏 1/40 秒。
+    返回值可能是负数、可能是分数——官方 layout 接受这种索引，但没有任何官方节点
+    会产出它，所以调用方必须先用 layout_contract 验证宿主语义。
+    """
+    end_frame = float(int(context_frames)) + float(overhang_steps) / FRAME_RESCALE
+    end_coord = round(FRAME_RESCALE * end_frame)
+    return end_coord / FRAME_RESCALE - float(int(audio_steps)) / FRAME_RESCALE
+
+
 def audio_window_start_seconds(plan: dict) -> float:
     """本段要喂给模型的音频起点 = **渲染窗口起点**。
 
@@ -333,6 +368,44 @@ def meta_issues(prev: dict, cur: dict) -> list[str]:
 
 
 # ---------------------------------------------------------------- 读写
+
+
+def provenance_issues(prev: dict, prev_context_sha: str,
+                      prevprev: dict | None = None,
+                      prevprev_context_sha: str | None = None) -> list[str]:
+    """链血缘校验：上一段是不是**在当前的上上段**基础上生成的。
+
+    `meta_issues` 只守坐标系与时间轴；`read_context` 只守单个文件。
+    两者都回答不了「第 5 段被 force_rerun 之后，第 6 段还是旧的」——
+    这种状态下跑第 7 段不会报错，接缝却接的是旧内容。
+    旧 meta 没有这两个字段时按 legacy 放行（不拦历史链）。
+    """
+    issues: list[str] = []
+    if not isinstance(prev, dict):
+        return ["上一段的 meta.json 读不出来（不是 JSON 对象）"]
+
+    recorded = prev.get("context_sha256")
+    if recorded and prev_context_sha and recorded != prev_context_sha:
+        issues.append(
+            f"上一段状态文件的哈希与它 meta 里记录的不一致"
+            f"（记录 {str(recorded)[:12]}，实际 {str(prev_context_sha)[:12]}）"
+            "——文件被改过或写坏了"
+        )
+
+    recorded_prev = prev.get("prev_context_sha256")
+    if recorded_prev:
+        if prevprev is None:
+            issues.append(
+                "上一段记录了「更早一段」的上下文哈希，但那个段目录已经不存在"
+                "——中间段被删过，请从缺失处重跑"
+            )
+        elif prevprev_context_sha and recorded_prev != prevprev_context_sha:
+            issues.append(
+                f"上一段是在**旧的上上段**基础上生成的"
+                f"（记录 {str(recorded_prev)[:12]}，实际 {str(prevprev_context_sha)[:12]}）"
+                "——上游被重跑过，请从上一段起重跑，否则接缝会接旧内容"
+            )
+    return issues
 
 
 def read_json(path: Path) -> dict:

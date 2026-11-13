@@ -10,7 +10,7 @@ MiniMax H3 的**分段续接**节点：一次执行只跑一段，段间上下�
 
 ## 为什么要有它
 
-现成的两条长视频路线（T8 InNodeLoop、JZL 无限时长）都是「一次执行跑完整条链」，
+现成的几条长视频路线（T8、JZL、ooizj、ZenHG，身份与版本见下）都是「一次执行跑完整条链」，
 由此带来三个绕不过去的限制：
 
 | 问题 | 一条链跑一次 | 本节点（一段一次） |
@@ -24,22 +24,25 @@ MiniMax H3 的**分段续接**节点：一次执行只跑一段，段间上下�
 
 ---
 
-## 两个参考实现，各取所长
+## 四个参考实现，各取所长
 
-读完 T8 与 JZL 的源码后的结论：
+本地核对过四个同类项目。它们来自四位不同作者、版本不同，先锚定身份：
 
-| 维度 | T8 InNodeLoop | JZL 无限时长 | 本节点取 |
-|---|---|---|---|
-| 段间引导 | 自己 patch `extra_conds`，每个 token 一个 keyframe + 帧偏移 | 官方 `minimax_keyframes`，一个多帧 keyframe | **JZL**：官方字段，不 patch 模型，升级不易碎；也不会和其他 keyframe 类节点互斥 |
-| 视频/音频 shift | 自研双时钟采样（12 / 3） | 不设，用模型默认 | **T8 的语义**，用官方 `MiniMaxH3SigmaShift` 的同一实现（换 `model_sampling` + `transformer_options`） |
-| 采样 | 自研循环（带 preview / 断点回调） | `comfy.sample.sample` | 官方路径（`comfy.sample.sample`） |
-| 裁剪 | 像素域裁衔接窗口 | 像素域裁 + settle（默认 12 帧） | 像素域裁衔接窗口；**settle 暂未实现**（它需要额外的时间轴记账，见下） |
-| 上下文 | manifest + candidate.context.safetensors | 只在内存里，不落盘 | 落盘的 `video_tail` / `audio_tail`（本包自己的格式，带 sha256） |
-| 代码形态 | 一个包 + orchestration / av runtime / delivery 多模块 | 一个 6000 行的巨型节点 | 4 个模块，纯函数可测 |
+| 项目 | 版本 | 执行模型 | 段间引导 | 音频 | 本节点取 / 不取 |
+|---|---|---|---|---|---|
+| **T8** `comfyui-minimax-h3-audio-T8` | 本地无源码 | 一次执行跑完整条链 | 按 README 口径为 keyframe 路线，未核对 | 双时钟 shift（12 / 3） | 取：shift 语义 |
+| **JZL** `wjluoxiao/ComfyUI-JZL-MiniMax-H3` | 0.9.10 | 一次执行、节点内循环 | 官方 `minimax_keyframes`，一个多帧块 | 同步裁 + 12 帧过渡丢弃 | 取：多帧 keyframe；不取：settle |
+| **ooizj** `ooizj/ComfyUI-H3-Long-Video` | 0.14.0 | 一次执行跑完整条链 | 官方 keyframes，逐 token | **结束对齐 + 分数/负索引** | 取：音频相位、布局守卫 |
+| **ZenHG** `ZenHG/ComfyUI-H3-Latent-Relay` | 0.6.39 | 一段一次 + Chain | latent 拷贝 + `noise_mask` 硬锁 | 声锚 + 音频缝 | 不取：mask 桥（宿主耦合） |
+| **本节点** | — | **一段一次** | 官方 keyframes，一个多帧块 | 整窗钉死 + 参考音频 | — |
 
-JZL 在拼接时用 settle（窗口 + 12 帧过渡丢弃）吸掉"模仿引导 → 启动新动作"的 hold→pop。
-本节点暂时把 settle 设为 0：每段独立提交时，丢额外帧会让"段的时间轴"和"音频窗口"错位
-（要多记一个偏移，跨段会累积）。等 P1 接缝实测后再决定是否按段记账引入。
+五处取舍：
+
+- **段间引导**：官方字段不 patch，升级不易碎，也不会和其他 keyframe 类节点互斥。
+- **双时钟 shift**：用官方 `MiniMaxH3SigmaShift` 的同一实现（换 `model_sampling` + `transformer_options`）。
+- **音频相位**：续接段的音频尾**结束**对齐钉住窗，索引可为分数/负数（与 ooizj 同思路），首跑前用 `layout_contract` 验证宿主语义。
+- **裁剪**：像素域裁衔接窗口；**settle 暂未实现**——每段独立提交时，丢额外帧会让段的时间轴和音频窗口错位（要多记一个偏移，跨段会累积）。等实测出现 hold→pop 再按 12/29/46 记账引入。
+- **不采用拷贝桥**：`noise_mask` 硬锁精度更高，但绑定宿主 ≥0.35 并多一份 latent 拷贝，与「零依赖」冲突；如需要另开节点。
 
 ---
 
@@ -114,7 +117,7 @@ H3 视频 latent 的 T 轴不均匀：token k 覆盖 `FRAME_PER_TOKEN[k%5]=(1,4,
 ## 节点：RS - H3 分段续接（单段）
 
 必填：`model / clip / video_vae / audio_vae`、`chain_dir`、`segment_index`、`prompt`、`seed`、
-`width / height`（32 的倍数）、`render_window_frames`、`context_frames`、`steps`、`cfg`、
+`width / height`（32 的倍数）、`render_window_frames`、`context_frames`（5 / 22 / 39 / 56 / 73 / 90 帧）、`steps`、`cfg`、
 `shift_video / shift_audio`、`sampler_name / scheduler`、`ref_scale`。
 
 可选：
@@ -128,7 +131,9 @@ H3 视频 latent 的 T 轴不均匀：token k 覆盖 `FRAME_PER_TOKEN[k%5]=(1,4,
 - `ref_audio_0/1/2`：独立参考音频（音色/环境声参考），最多 3 个；
 - `sigmas`：自定义 Sigmas（SIGMAS）。接了它就走 `comfy.sample.sample_custom`，
   `scheduler` / `steps` / `shift_video` / `shift_audio` 全部不参与——`video_pika_h3_flex_ref2va`
-  必须用 `KSamplerSelect=lcm` + `ManualSigmas` 这条路线。
+  必须用 `KSamplerSelect=lcm` + `ManualSigmas` 这条路线；
+- `seam_luma`：接缝亮度过渡（默认开）。第 2 段起把前 12 帧的**全局亮度**从上一段末帧渐变到本段自身亮度，
+  单帧幅度 ≤ 0.10、阈值 0.008；只改亮度不改色相，差值小于阈值时逐像素直通。关掉即完全不动画面。
 
 音频的三种用法（别混）：
 
@@ -137,6 +142,11 @@ H3 视频 latent 的 T 轴不均匀：token k 覆盖 `FRAME_PER_TOKEN[k%5]=(1,4,
 | `drive_audio` | **时间轴音轨**：按段窗口切出、编码成 `audio_latent` 钉在段首；成片直接用它 | 是 | 动作被钉死在这首歌上；每段都要带一个整窗音频 latent |
 | `ref_audio_0..2` | **参考音色/环境**：作为 `minimax_refs` 的条件，不占时间轴 | 否（只影响生成） | 不能保证逐拍同步；更像"给模型听一段参考" |
 | 提示词描述音乐 | 纯语义（"follow <Audio 1>" / 描述鼓点） | 否 | 最便宜，但节拍、音色都不可控 |
+
+**续接段的音频相位**：第 2 段起（且没接 `drive_audio`）音频尾不是从 0 开始，而是**结束**在钉住窗末端。
+源段音频按总帧数四舍五入，可能比视频多或少 1/3 步；节点用带符号的 overhang 与音频栅格吸附补偿，
+`report.audio_pin.index` 会写出实际索引（可能是负数）。宿主布局语义首次使用时由 `layout_contract` 校验，
+不通过就退回索引 0 并在 `report.audio_pin.fallback_origin` 标注。
 
 画布面板有一个「音频用途（第 1 个音频给谁）」：
 - **驱动音频（时间轴音轨）** → 第 1 个音频进 `drive_audio`，其余进 `ref_audio_0..2`；
@@ -204,10 +214,15 @@ cond token 与目标 token 在同一时间点混在一起。画布上的「关�
 <chain_dir>/
   seg_00001/tail.context.safetensors   # video_tail [1,24,7,h,w] + audio_tail [1,32,2,37]
   seg_00001/meta.json                  # 画幅/窗口/帧率/提示词哈希/种子/耗时
+                                       # + context_sha256 / prev_context_sha256 / provenance
 ```
 
 `meta.json` 只在**解码成功之后**才写，所以"半截状态"不会被当成可用；
 上下文文件带 sha256 与段号，被改过、属于别的链、窗口不一致都会被明确拒绝。
+
+**血缘校验**：每段记录自己的上下文哈希、以及它消费的上一段哈希。跑第 k 段时会核对
+「第 k−1 段记录的上一段哈希」是否等于第 k−2 段的实际哈希——所以 `force_rerun` 重跑中间段后，
+直接跳到后面会被明确拒绝，而不是静默接旧内容。旧链（没有这两个字段）按 `legacy` 放行并在 report 标注。
 
 ### 画布接线（RS-Canvas）
 
@@ -227,8 +242,9 @@ cond token 与目标 token 在同一时间点混在一起。画布上的「关�
 
 | 想做什么 | 做法 |
 |---|---|
-| 重跑第 5 段 | `RS_H3ChainManage(reset_from=5, confirm=true)` → 依次跑 5、6、…（6 之后必须重跑：它们吃的是 5 的尾巴） |
+| 重跑第 5 段 | `RS_H3ChainManage(reset_from=5, confirm=true)` → 依次跑 5、6、…（6 之后必须重跑：它们吃的是 5 的尾巴；现在会被血缘校验强制拦下） |
 | 只改第 5 段的提示词 | 同上；1–4 不动 |
+| 只想重跑第 7 段 | 不允许：第 6 段记录的上上段哈希与当前第 5 段不符时会明确报错，请从第 6 段起重跑 |
 | 接着加长 | 直接跑 `segment_index=17` 起，不需要改任何"总时长" |
 | 换画幅/窗口 | 画幅变了 → **必须换新的 `chain_dir`**（旧 latent 尾巴对新条件没有意义，节点会明确拒绝）。窗口可以在段间变（末段对准目标时长），时间轴会从上一段 meta 续上 |
 
@@ -237,7 +253,7 @@ cond token 与目标 token 在同一时间点混在一起。画布上的「关�
 ## 已知限制
 
 1. **每段一次提交**，模型在 TE 与扩散之间来回切换，约多 30–60 秒/段；
-2. `settle`（额外丢过渡帧）未实现，接缝处可能有约 0.5 秒的"启动感"；P1 实测后再定；
+2. `settle`（额外丢过渡帧）未实现，接缝处可能有轻微"启动感"；已用 `seam_luma`（12 帧加性亮度过渡）削掉最显眼的亮度台阶，动作层的 hold→pop 仍等实测后再按 12/29/46 记账引入；
 3. 参考视频会按 768 短边画布缩放，长度超过本段渲染窗口的部分会被裁掉（至少 5 帧）；
 4. 音频锚点是"整段钉住"：模型生成的音轨会被丢弃，只用作画面同步信号；
 5. 关键帧每个段节点 3 个槽位；更多请把关键帧拆到相邻段（段的时间轴是连续的，效果等价）；

@@ -19,10 +19,11 @@ try:  # 只在 ComfyUI 里存在；纯函数单测不会 import 本模块
 except Exception:  # noqa: BLE001
     folder_paths = None
 
-from . import h3, media
+from . import h3, layout_contract, media
 from .state import (
     CONTEXT_FRAME_CHOICES,
     FPS,
+    audio_guide_index,
     keyframe_local_frame,
     ChainError,
     audio_window_start_seconds,
@@ -34,6 +35,7 @@ from .state import (
     meta_issues,
     meta_path,
     plan_segment,
+    provenance_issues,
     read_json,
     resolve_chain_root,
     sanitize_name,
@@ -126,6 +128,8 @@ class RS_H3ChainSegment:
                 "keyframe_image_3": ("IMAGE",),
                 "keyframe_time_3": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 100000.0, "step": 0.1}),
                 "sigmas": ("SIGMAS",),
+                # 追加在 optional 最后：widgets_values 按位存，插在中间会让存量工作流错槽
+                "seam_luma": ("BOOLEAN", {"default": True}),
             },
         }
 
@@ -183,6 +187,7 @@ class RS_H3ChainSegment:
         keyframe_image_3=None,
         keyframe_time_3=-1.0,
         sigmas=None,
+        seam_luma=True,
     ):
         if not str(prompt or "").strip():
             raise ChainError("prompt 为空：这一段没有任何动作描述，先给提示词再跑")
@@ -227,11 +232,13 @@ class RS_H3ChainSegment:
 
         # ---- 上一段
         prev = None
+        provenance_status = "no_prev"
         if plan["index"] > 1:
             prev_meta_path = meta_path(root, plan["index"] - 1)
             prev_ctx_path = context_path(root, plan["index"] - 1)
             if prev_meta_path.is_file() and prev_ctx_path.is_file():
-                issues = meta_issues(read_json(prev_meta_path), meta)
+                prev_meta = read_json(prev_meta_path)
+                issues = meta_issues(prev_meta, meta)
                 if issues:
                     raise ChainError(
                         "上一段与本段的坐标系不一致，接上去只会静默错位：\n  - "
@@ -244,6 +251,33 @@ class RS_H3ChainSegment:
                     source_index=plan["index"] - 2,
                     context_frames=plan["context_frames"],
                 )
+                # 血缘：上一段消费的必须是**当前**的上上段，而不是被重跑前的旧版本。
+                prevprev_meta = None
+                prevprev_sha = None
+                if plan["index"] > 2:
+                    pp_meta_path = meta_path(root, plan["index"] - 2)
+                    pp_ctx_path = context_path(root, plan["index"] - 2)
+                    if pp_meta_path.is_file():
+                        prevprev_meta = read_json(pp_meta_path)
+                    if pp_ctx_path.is_file():
+                        prevprev_sha = media.context_digest(pp_ctx_path)
+                prov = provenance_issues(prev_meta, prev["sha256"], prevprev_meta, prevprev_sha)
+                if prov:
+                    raise ChainError(
+                        "链血缘校验失败，接上去会接旧内容：\n  - "
+                        + "\n  - ".join(prov)
+                        + "\n（上游段被重跑或删除过：从上一段起重跑，不要只跑本段）"
+                    )
+                verified = bool(prev_meta.get("context_sha256")) and (
+                    plan["index"] == 2 or bool(prev_meta.get("prev_context_sha256"))
+                )
+                provenance_status = "verified" if verified else "legacy"
+                if provenance_status == "legacy":
+                    print(
+                        f"[RS-H3Chain] 段{plan['index']} 的上一段是旧格式（无血缘字段），"
+                        "本次按 legacy 放行",
+                        flush=True,
+                    )
             elif not allow_no_prev:
                 raise ChainError(
                     f"第 {plan['index']} 段需要第 {plan['index'] - 1} 段的状态，但 {segment_dir(root, plan['index'] - 1)} 里没有。"
@@ -300,11 +334,43 @@ class RS_H3ChainSegment:
         audio_t = h3.temporal_shape(plan["render_frames"])[2]
         audio_pin = h3.encode_audio_guide(audio_vae, win_audio, audio_t) if win_audio is not None else None
         video_pin = prev["video_tail"] if prev is not None else None
+
+        # 续接段的音频尾必须**结束**在钉住窗末端，而不是从 0 开始：
+        # 源段音频按总帧数四舍五入生成，比视频多或少 1/3 步；固定 index=0 只在
+        # render ≡ 1 (mod 3) 时正确，107/158 这类窗口会把音频放晚 0.4 帧。
+        audio_tail_to_pin = audio_pin
+        audio_pin_index = 0.0
+        audio_overhang_steps = None
+        audio_pin_fallback = False
+        if audio_tail_to_pin is None and prev is not None:
+            audio_tail_to_pin = prev["audio_tail"]
+            audio_overhang_steps = float(prev["meta"].get("audio_overhang", 0.0) or 0.0)
+            audio_pin_index = audio_guide_index(
+                plan["context_frames"],
+                int(audio_tail_to_pin.shape[-1]),
+                audio_overhang_steps,
+            )
+            if abs(audio_pin_index) > 1e-9:
+                try:
+                    layout_contract.ensure()
+                except ChainError as exc:
+                    # 宿主语义变了：退回 origin，并在 report 里写明降级（不阻断出片）
+                    print(f"[RS-H3Chain] ⚠ 布局校验失败，音频锚点退回索引 0：{exc}", flush=True)
+                    audio_pin_index = 0.0
+                    audio_pin_fallback = True
+                else:
+                    print(
+                        f"[RS-H3Chain] 段{plan['index']} 音频锚点索引 {audio_pin_index:+.3f}"
+                        f"（overhang {audio_overhang_steps:+.3f} 步）",
+                        flush=True,
+                    )
+
         positive = h3.add_guide_keyframe(
             positive,
             video_pin,
-            audio_pin if audio_pin is not None else (prev["audio_tail"] if prev is not None else None),
+            audio_tail_to_pin,
             0,
+            audio_frame_index=audio_pin_index,
         )
 
         # ---- 关键帧：按**成片时间轴**（秒）给位置，节点换算成本段渲染窗口内的帧号。
@@ -401,6 +467,28 @@ class RS_H3ChainSegment:
         # ---- 裁头：段首被钉住的窗口帧解码后会原样出现，必须裁掉（音频同量裁）
         drop = plan["head_trim"]
         out_frames = media.trim_frames(frames, drop)
+
+        # 接缝亮度过渡：只改亮度、不改色相；差值小于阈值时逐像素直通。
+        luma_info = {
+            "applied": False,
+            "prev_luma": None,
+            "first_luma": round(media.frame_luma(out_frames[0]), 6),
+            "frames": 0,
+            "max_delta": 0.0,
+        }
+        if seam_luma and prev is not None:
+            prev_luma = prev["meta"].get("last_luma")
+            if prev_luma is None:
+                luma_info["note"] = "上一段没有记录末帧亮度（旧格式），本段跳过"
+            else:
+                out_frames, luma_info = media.luma_transition(out_frames, float(prev_luma))
+                if luma_info.get("applied"):
+                    print(
+                        f"[RS-H3Chain] 段{plan['index']} 接缝亮度过渡："
+                        f"{luma_info['prev_luma']:.4f} → {luma_info['first_luma']:.4f}"
+                        f"（最大 ±{luma_info['max_delta']:.4f}，{luma_info['frames']} 帧）",
+                        flush=True,
+                    )
         delivery_audio = win_audio if win_audio is not None else generated_audio
         if delivery_audio is None:
             raise ChainError("本段没有可交付的音频（既没有 drive_audio，模型也没生成音频）")
@@ -425,10 +513,15 @@ class RS_H3ChainSegment:
             context_frames=plan["context_frames"],
             audio_overhang=h3.audio_overhang(sampled),
             source_frames=h3.pixel_frames_from_latent_t(int(sampled_video.shape[2])),
+            last_luma=media.frame_luma(out_frames[-1]),
         )
         meta["ref_hashes"] = [media.image_fingerprint(img) for img in refs]
         meta["drop_head_frames"] = drop
         meta["context_shape"] = ctx_info
+        meta["context_sha256"] = ctx_info["context_sha256"]
+        meta["prev_context_sha256"] = prev["sha256"] if prev is not None else None
+        meta["provenance"] = provenance_status
+        meta["seam_luma"] = luma_info
         meta["elapsed_seconds"] = round(time.time() - t0, 1)
         meta["elapsed"] = {
             "conditioning": round(t_cond, 1),
@@ -448,8 +541,17 @@ class RS_H3ChainSegment:
             "output_seconds": round(int(out_frames.shape[0]) / 24.0, 3),
             "timeline_start_seconds": round(plan["timeline_start_seconds"], 3),
             "has_prev_context": prev is not None,
+            "provenance": provenance_status,
             "audio_guided": audio_pin is not None,
+            "audio_pin": {
+                "index": round(float(audio_pin_index), 6),
+                "overhang_steps": (
+                    None if audio_overhang_steps is None else round(float(audio_overhang_steps), 6)
+                ),
+                "fallback_origin": bool(audio_pin_fallback),
+            },
             "keyframes": applied_keyframes,
+            "seam_luma": luma_info,
             "refs": {
                 "images": len(refs),
                 "videos": len(ref_videos),

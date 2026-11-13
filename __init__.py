@@ -1,7 +1,10 @@
 """RS - H3 分段续接（ComfyUI-RS-H3Chain）。
 
-独立包，不修改任何第三方节点。依赖 T8 节点包（comfyui-minimax-h3-audio-T8）提供的
-conditioning / 采样 / 解码实现；本包只负责「一次执行一段 + 段间上下文落盘」。
+独立包，不修改任何第三方节点，**不依赖任何第三方节点包**：
+条件编码、跨段引导、双时钟 shift、采样、解码全部走 ComfyUI 核心
+（`comfy.sample` / `comfy.nested_tensor` / `node_helpers` /
+`comfy.model_sampling` / `comfy_extras.nodes_minimax_h3`）。
+本包只负责「一次执行一段 + 段间上下文落盘 + 血缘校验」。
 """
 
 from __future__ import annotations

@@ -112,6 +112,66 @@ def trim_frames(frames: torch.Tensor, drop: int) -> torch.Tensor:
     return frames[int(drop):]
 
 
+def frame_luma(frame: torch.Tensor) -> float:
+    """单帧亮度（Rec.709 加权，[H,W,C] 或 [1,H,W,C]）。"""
+    rgb = frame[..., :3].float()
+    if rgb.ndim == 4:
+        rgb = rgb[0]
+    return float(
+        (rgb[..., 0] * 0.2126 + rgb[..., 1] * 0.7152 + rgb[..., 2] * 0.0722).mean().item()
+    )
+
+
+def luma_transition(frames: torch.Tensor, prev_luma: float,
+                    frames_n: int = 12, max_delta: float = 0.10,
+                    eps: float = 0.008):
+    """接缝首帧的**全局加性亮度**过渡（不复制轮廓、不压局部对比）。
+
+    依据：官方 Director 实测只保留这一种接缝亮度做法——每帧给 RGB 加同一个 delta，
+    单帧限幅，逐帧从上一段末帧亮度过渡到本段自身亮度。
+    只改亮度、不改色相；三项差值都小于阈值时逐像素直通。
+
+    返回 `(frames, info)`，`info` 会原样进 report 与 meta。
+    """
+    n = min(int(frames_n), int(frames.shape[0]))
+    first_luma = frame_luma(frames[0]) if int(frames.shape[0]) else 0.0
+    prev_value = None if prev_luma is None else float(prev_luma)
+    info = {
+        "applied": False,
+        "prev_luma": None if prev_value is None else round(prev_value, 6),
+        "first_luma": round(first_luma, 6),
+        "frames": n,
+        "max_delta": 0.0,
+    }
+    if n < 1 or prev_value is None:
+        return frames, info
+
+    y0 = first_luma
+    y1 = frame_luma(frames[1]) if n > 1 else y0
+    y2 = frame_luma(frames[2]) if n > 2 else y1
+    y_end = frame_luma(frames[n - 1])
+    gap = abs(y0 - prev_value)
+    spike = abs(y1 - y0) + abs(y2 - y1)
+    if gap < eps and spike < eps and abs(y_end - prev_value) < eps:
+        return frames, info
+
+    out = frames.clone()
+    applied_max = 0.0
+    for i in range(n):
+        t = float(i) / float(n)
+        target = prev_value * (1.0 - t) + y_end * t
+        current = frame_luma(out[i])
+        delta = max(-float(max_delta), min(float(max_delta), target - current))
+        if abs(delta) < 1e-5:
+            continue
+        out[i] = (out[i].float() + delta).clamp(0.0, 1.0).to(dtype=frames.dtype)
+        applied_max = max(applied_max, abs(delta))
+
+    info["applied"] = applied_max > 0.0
+    info["max_delta"] = round(applied_max, 6)
+    return out, info
+
+
 def image_fingerprint(image: torch.Tensor) -> str:
     """参考图指纹（取第一帧，12 位十六进制）。
 
@@ -132,6 +192,11 @@ def tensor_sha256(tensor: torch.Tensor) -> str:
 # ---------------------------------------------------------------- 上下文文件
 
 
+def _combined_digest(video_sha: str, audio_sha: str) -> str:
+    """上下文文件的组合哈希：视频尾 + 音频尾。"""
+    return hashlib.sha256(f"{video_sha}:{audio_sha}".encode("ascii")).hexdigest()
+
+
 def write_context(
     path: Path,
     video_tail: torch.Tensor,
@@ -142,13 +207,18 @@ def write_context(
     context_frames: int,
     audio_overhang: float,
     source_frames: int,
+    last_luma: float | None = None,
 ) -> dict:
     """把本段的衔接窗口落盘（video_tail / audio_tail + 校验和）。
 
     `segment_index` 是 **0 起**（与官方 keyframe 的段号语义一致）；`meta.json` 里是 1 起。
+    `last_luma` 是本段交付最后一帧的亮度，供下一段做接缝亮度过渡（旧文件可为空）。
     """
     if video_tail is None or audio_tail is None:
         raise ChainError("上下文尾巴为空：采样结果里没有 video/audio latent")
+    video_sha = tensor_sha256(video_tail)
+    audio_sha = tensor_sha256(audio_tail)
+    digest = _combined_digest(video_sha, audio_sha)
     metadata = {
         "schema": str(CONTEXT_SCHEMA),
         "chain_id": str(chain_id),
@@ -161,8 +231,10 @@ def write_context(
         "audio_shape": json.dumps(list(audio_tail.shape)),
         "video_dtype": str(video_tail.dtype),
         "audio_dtype": str(audio_tail.dtype),
-        "video_sha256": tensor_sha256(video_tail),
-        "audio_sha256": tensor_sha256(audio_tail),
+        "video_sha256": video_sha,
+        "audio_sha256": audio_sha,
+        "context_sha256": digest,
+        "last_luma": "" if last_luma is None else repr(float(last_luma)),
     }
 
     from safetensors.torch import save_file
@@ -181,7 +253,12 @@ def write_context(
     finally:
         if tmp.exists():
             tmp.unlink()
-    return {"video_shape": list(video_tail.shape), "audio_shape": list(audio_tail.shape)}
+    return {
+        "video_shape": list(video_tail.shape),
+        "audio_shape": list(audio_tail.shape),
+        "context_sha256": digest,
+        "last_luma": last_luma,
+    }
 
 
 def read_context(
@@ -224,22 +301,56 @@ def read_context(
         raise ChainError(f"{target} 的 video 形状与 metadata 不符")
     if json.loads(meta.get("audio_shape", "[]")) != list(audio_tail.shape):
         raise ChainError(f"{target} 的 audio 形状与 metadata 不符")
-    if meta.get("video_sha256") and meta["video_sha256"] != tensor_sha256(video_tail):
+    video_sha = tensor_sha256(video_tail)
+    audio_sha = tensor_sha256(audio_tail)
+    if meta.get("video_sha256") and meta["video_sha256"] != video_sha:
         raise ChainError(f"{target} 的 video 校验和不符（文件被改过或写坏了）")
-    if meta.get("audio_sha256") and meta["audio_sha256"] != tensor_sha256(audio_tail):
+    if meta.get("audio_sha256") and meta["audio_sha256"] != audio_sha:
         raise ChainError(f"{target} 的 audio 校验和不符（文件被改过或写坏了）")
     if not torch.isfinite(video_tail).all() or not torch.isfinite(audio_tail).all():
         raise ChainError(f"{target} 含 NaN/Inf（采样发散），不能作为下一段的引导")
 
+    last_luma = None
+    raw_luma = meta.get("last_luma", "")
+    if raw_luma not in ("", None):
+        try:
+            last_luma = float(raw_luma)
+        except (TypeError, ValueError):
+            last_luma = None
+
     return {
         "video_tail": video_tail,
         "audio_tail": audio_tail,
+        "sha256": _combined_digest(video_sha, audio_sha),
         "meta": {
             "chain_id": str(chain_id),
             "source_segment_index": int(source_index),
             "context_frames": int(context_frames),
             "audio_overhang": float(meta.get("audio_overhang", 0.0) or 0.0),
             "source_frames": int(meta.get("source_frames", 0)),
+            "last_luma": last_luma,
             "path": str(target),
         },
     }
+
+
+def context_digest(path: Path) -> str:
+    """只读上下文文件的 metadata，拿它的组合哈希（不加载张量）。
+
+    用途：链路血缘校验只需要「上一段消费的是哪个版本的上上段」，
+    不需要把上上段的张量读进内存。
+    """
+    from safetensors import safe_open
+
+    target = Path(path)
+    if not target.is_file():
+        return ""
+    with safe_open(str(target), framework="pt", device="cpu") as handle:
+        meta = dict(handle.metadata() or {})
+    recorded = meta.get("context_sha256")
+    if recorded:
+        return str(recorded)
+    video_sha, audio_sha = meta.get("video_sha256", ""), meta.get("audio_sha256", "")
+    if video_sha and audio_sha:
+        return _combined_digest(video_sha, audio_sha)
+    return ""
